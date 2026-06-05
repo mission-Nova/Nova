@@ -3030,9 +3030,9 @@ document.addEventListener('click',function(e){
 <meta name="application-name" content="AIR-1 Performance OS">
 <meta name="description" content="Offline-first CA Final study productivity and discipline system.">
 <meta name="mobile-web-app-capable" content="yes">
-<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
-<link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
-<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
 <link rel="manifest" href="manifest.json">
 </head><body data-theme="dark">
 
@@ -3403,7 +3403,7 @@ document.addEventListener('click',function(e){
 
   /* Request notification permission on first interact */
   document.addEventListener('click', () => {
-    if(Notification.permission === 'default') Notification.requestPermission();
+    if('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch?.(() => {});
   }, {once:true});
 })();
 
@@ -6959,8 +6959,28 @@ document.addEventListener('click',function(e){
     if (AIR1Store?.setJSON) await AIR1Store.setJSON(key, value);
     return value;
   };
-  const loadDayLogs = async (dateStr) =&gt; AIR1Store?.getJSON ? AIR1Store.getJSON(`air1_logs_${dateStr}`, []) : parse(localStorage.getItem(`air1_logs_${dateStr}`), []);
-  const saveDayLogs = async (dateStr, logs) =&gt; { await setJSON(`air1_logs_${dateStr}`, logs); return logs; };
+  const loadDayLogs = async (dateStr) =&gt; {
+    const key = `air1_logs_${dateStr}`;
+    let localRaw = null;
+    try { localRaw = localStorage.getItem(key); } catch(e) {}
+    if (localRaw !== null) {
+      const localLogs = parse(localRaw, []);
+      const safeLogs = Array.isArray(localLogs) ? localLogs : [];
+      // localStorage is the immediate source of truth for this iframe. Mirror it back to IndexedDB
+      // so a stale IDB row can never hide a just-saved time log after reload.
+      try { AIR1Store?.setJSON?.(key, safeLogs)?.catch?.(() =&gt; {}); } catch(e) {}
+      return safeLogs;
+    }
+    const dbLogs = AIR1Store?.getJSON ? await AIR1Store.getJSON(key, []) : [];
+    return Array.isArray(dbLogs) ? dbLogs : [];
+  };
+  const saveDayLogs = async (dateStr, dayLogs) =&gt; {
+    const key = `air1_logs_${dateStr}`;
+    const safeLogs = Array.isArray(dayLogs) ? dayLogs : [];
+    await setJSON(key, safeLogs);
+    AIR1Bus?.publish('AIR1_TIME_LOGS_UPDATED', { date: dateStr, logs: safeLogs }, { source: 'app2' });
+    return safeLogs;
+  };
   const loadStreakState = async () =&gt; AIR1Store?.loadStreakState ? AIR1Store.loadStreakState() : parse(localStorage.getItem(STREAK_KEY), defaultStreakState());
   const saveStreakState = async (state) =&gt; { await setJSON(STREAK_KEY, state); AIR1Bus?.publish(&#x27;AIR1_STREAK_UPDATED&#x27;, state, { source: &#x27;app2&#x27; }); return state; };
 
@@ -7082,7 +7102,23 @@ document.addEventListener('click',function(e){
             renderDashboard();
         }
 
-        async function saveLogs() { await saveDayLogs(currentViewDate, logs); const updated = await evaluateStreakForDate(currentViewDate); baseStreak = updated.currentStreak || 0; renderDashboard(); renderStreakHeatmap(); }
+        async function saveLogs() {
+            const snapshot = Array.isArray(logs) ? logs.slice() : [];
+            renderDashboard();
+            renderStreakHeatmap();
+            try {
+                await saveDayLogs(currentViewDate, snapshot);
+                const updated = await evaluateStreakForDate(currentViewDate);
+                baseStreak = updated.currentStreak || 0;
+                renderDashboard();
+                renderStreakHeatmap();
+                return true;
+            } catch (err) {
+                console.error('AIR1 time log save failed', err);
+                alert('Time log save failed. Please export a backup and try again.');
+                return false;
+            }
+        }
 
         // --- GAP FILLER &amp; BACKUP (UPGRADED) ---
 // --- GAP FILLER &amp; BACKUP (UPGRADED) ---
@@ -7205,7 +7241,7 @@ document.addEventListener('click',function(e){
             saveLogs();
         }
 
-        document.getElementById(&#x27;logForm&#x27;).addEventListener(&#x27;submit&#x27;, function(e) {
+        document.getElementById(&#x27;logForm&#x27;).addEventListener(&#x27;submit&#x27;, async function(e) {
             e.preventDefault();
             const log = {
                 id: Date.now(),
@@ -7226,7 +7262,7 @@ document.addEventListener('click',function(e){
                 alert(`Cap reached. Adjusting duration from ${log.duration}m down to ${available}m to fit 1440 limit.`);
                 log.duration = available;
             }
-            logs.push(log); saveLogs(); this.reset(); toggleFormFields();
+            logs.push(log); if (await saveLogs()) { this.reset(); toggleFormFields(); }
         });
 
         function editLog(index) {
@@ -9948,7 +9984,9 @@ setInterval(function(){
         logs.forEach(l => timeLogs.push({ ...l, date: day }));
       }
     }
-    const topics = Array.isArray(revDb.topics) ? revDb.topics.slice() : [];
+    const syllabusState = parse(localStorage.getItem('air1_msv_state_v2'), {});
+    const syllabusTopics = topicsFromSyllabusState(syllabusState, history);
+    const topics = mergeTopicSources(Array.isArray(revDb.topics) ? revDb.topics.slice() : [], syllabusTopics);
     const tests = [];
     (Array.isArray(revDb.tests) ? revDb.tests : []).forEach(t => tests.push({ ...t, source:'revision' }));
     (Array.isArray(matrixTests) ? matrixTests : []).forEach(t => tests.push({ ...t, source:'matrix' }));
@@ -9977,6 +10015,45 @@ setInterval(function(){
       sessions: sessions.filter(s => s.subj === subj),
       journalDays: journal.filter(j => (j.sessions || []).some(s => s.subj === subj))
     }));
+    return merged;
+  }
+
+  function topicsFromSyllabusState(state, history = []) {
+    const topicMap = state && state.topics && typeof state.topics === 'object' ? state.topics : {};
+    return Object.entries(topicMap).map(([key, value]) => {
+      const [subj, ...topicParts] = String(key).split('::');
+      const topic = topicParts.join('::');
+      if (!SUBJECTS.includes(subj) || !topic) return null;
+      const itemHistory = history.filter(h => h.subj === subj && topicMatches(h.topic, topic));
+      const firstDate = itemHistory.map(h => h.date).filter(Boolean).sort()[0] || todayKey();
+      const phaseDate = (phase) => (itemHistory.find(h => String(h.action || '').toUpperCase() === `R${phase}`)?.date) || firstDate;
+      const confidence = { High: 5, Medium: 3, Low: 1 }[value?.conf] || 3;
+      return {
+        id: `msv:${key}`,
+        subj,
+        topic,
+        conf: confidence,
+        abc: Number(value?.weight || 1) >= 3 ? 'A' : Number(value?.weight || 1) === 2 ? 'B' : 'C',
+        day0: firstDate,
+        source: 'syllabus-tracker',
+        history: itemHistory.map(h => ({ date: h.date, action: h.action, meta: h.meta || {} })),
+        schedules: [1,2,3,4].map(phase => ({ phase, date: phaseDate(phase), done: !!value?.[`r${phase}`] }))
+      };
+    }).filter(Boolean);
+  }
+
+  function mergeTopicSources(primaryTopics, secondaryTopics) {
+    const merged = [];
+    const seen = new Set();
+    const add = (topic) => {
+      if (!topic || !topic.subj || !topic.topic) return;
+      const key = `${topic.subj}|${canonicalTopic(topic.topic)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      merged.push(topic);
+    };
+    primaryTopics.forEach(add);
+    secondaryTopics.forEach(add);
     return merged;
   }
 
@@ -10827,9 +10904,7 @@ setInterval(function(){
   }
 
   function refresh() {
-    DBCACHE.caAir1Db_v3 = null;
-    DBCACHE.caAir1Db = null;
-    DBCACHE.air1MatrixDbV3 = null;
+    Object.keys(DBCACHE).forEach(key => { DBCACHE[key] = null; });
     renderAll();
   }
 
